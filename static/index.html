@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Table Calculator</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        h1 {
+            color: #333;
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
+        
+        table {
+            border-collapse: collapse;
+            background-color: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px 12px;
+            text-align: right;
+            min-width: 80px;
+        }
+        
+        th {
+            background-color: #f8f8f8;
+            font-weight: bold;
+            position: sticky;
+            top: 0;
+            cursor: pointer;
+            user-select: none;
+        }
+        
+        th:hover {
+            background-color: #e8e8e8;
+        }
+        
+        th.sortable::after {
+            content: " ↕";
+            color: #999;
+            font-size: 12px;
+        }
+        
+        th.sorted-asc::after {
+            content: " ↑";
+            color: #4CAF50;
+        }
+        
+        th.sorted-desc::after {
+            content: " ↓";
+            color: #4CAF50;
+        }
+        
+        tr.dragging {
+            opacity: 0.5;
+        }
+        
+        tr.drag-over {
+            border-top: 3px solid #4CAF50;
+        }
+        
+        th.dragging {
+            opacity: 0.5;
+        }
+        
+        th.drag-over {
+            border-left: 3px solid #4CAF50;
+        }
+        
+        td[tabindex] {
+            cursor: cell;
+        }
+        
+        td[tabindex]:focus {
+            outline: 2px solid #4CAF50;
+            outline-offset: -2px;
+        }
+        
+        td[contenteditable="true"] {
+            cursor: text;
+            background-color: #f0f8ff;
+        }
+        
+        .row-number {
+            background-color: #f8f8f8;
+            font-weight: bold;
+            text-align: center;
+        }
+        
+        button {
+            margin: 10px 0;
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        button:hover {
+            background-color: #45a049;
+        }
+        
+        #status {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        
+        .connected {
+            background-color: #4CAF50;
+            color: white;
+        }
+        
+        .disconnected {
+            background-color: #f44336;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <h1>Simple Table Calculator</h1>
+    <div id="status" class="disconnected">接続中...</div>
+    
+    <button onclick="addRow()">行を追加</button>
+    <button onclick="downloadCSV()">CSVダウンロード</button>
+    
+    <table id="table">
+        <thead>
+            <tr id="header-row">
+            </tr>
+        </thead>
+        <tbody id="tbody">
+        </tbody>
+    </table>
+    
+    <datalist id="param-suggestions">
+        <option value="0.5">
+        <option value="1.0">
+        <option value="1.5">
+        <option value="2.0">
+        <option value="10">
+        <option value="100">
+    </datalist>
+
+    <script>
+        let ws = null;
+        let currentCell = null;
+        let editMode = false;
+        let originalValue = '';
+        let sortColumn = null;
+        let sortDirection = 'asc';
+        let columnOrder = ["param", "a", "b", "c"];
+        let draggedRow = null;
+        let draggedColumn = null;
+        
+        // セッションID生成（URLパラメータまたは新規生成）
+        function getSessionId() {
+            const params = new URLSearchParams(window.location.search);
+            let sessionId = params.get('session');
+            
+            if (!sessionId) {
+                sessionId = localStorage.getItem('sessionId');
+                if (!sessionId) {
+                    sessionId = 'session-' + Math.random().toString(36).substr(2, 9);
+                    localStorage.setItem('sessionId', sessionId);
+                }
+                // URLにセッションIDを追加
+                params.set('session', sessionId);
+                window.history.replaceState({}, '', '?' + params.toString());
+            } else {
+                // URLのセッションIDをローカルストレージに保存
+                localStorage.setItem('sessionId', sessionId);
+            }
+            
+            return sessionId;
+        }
+        
+        const sessionId = getSessionId();
+        
+        // WebSocket接続
+        function connect() {
+            ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}`);
+            
+            ws.onopen = () => {
+                document.getElementById('status').textContent = '接続済み';
+                document.getElementById('status').className = 'connected';
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.rows) {
+                    if (data.column_order) {
+                        columnOrder = data.column_order;
+                    }
+                    updateTable(data.rows);
+                }
+            };
+            
+            ws.onclose = () => {
+                document.getElementById('status').textContent = '切断されました';
+                document.getElementById('status').className = 'disconnected';
+                setTimeout(connect, 3000); // 3秒後に再接続
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+        }
+        
+        // テーブル更新
+        function updateTable(rows) {
+            // ヘッダー更新
+            updateHeader();
+            
+            const tbody = document.getElementById('tbody');
+            const focusedCell = currentCell;
+            const focusedId = focusedCell ? {
+                row: focusedCell.dataset.row,
+                column: focusedCell.dataset.column
+            } : null;
+            
+            tbody.innerHTML = '';
+            
+            // ソート処理
+            let sortedRows = [...rows];
+            if (sortColumn) {
+                sortedRows.sort((a, b) => {
+                    let aVal = sortColumn === 'id' ? a.id : a[sortColumn];
+                    let bVal = sortColumn === 'id' ? b.id : b[sortColumn];
+                    
+                    if (aVal === null) aVal = '';
+                    if (bVal === null) bVal = '';
+                    
+                    if (typeof aVal === 'number' && typeof bVal === 'number') {
+                        return sortDirection === 'asc' ? aVal - bVal : bVal - aVal;
+                    } else {
+                        const result = String(aVal).localeCompare(String(bVal));
+                        return sortDirection === 'asc' ? result : -result;
+                    }
+                });
+            }
+            
+            sortedRows.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.draggable = true;
+                tr.dataset.rowId = row.id;
+                
+                let cells = `<td class="row-number">${row.id}</td>`;
+                columnOrder.forEach(col => {
+                    const value = row[col] !== null ? row[col] : '';
+                    cells += `<td tabindex="0" data-row="${row.id}" data-column="${col}">${value}</td>`;
+                });
+                
+                tr.innerHTML = cells;
+                tbody.appendChild(tr);
+                
+                // 行のドラッグイベント
+                tr.addEventListener('dragstart', (e) => {
+                    draggedRow = tr;
+                    e.dataTransfer.effectAllowed = 'move';
+                    tr.classList.add('dragging');
+                });
+                
+                tr.addEventListener('dragend', () => {
+                    tr.classList.remove('dragging');
+                    draggedRow = null;
+                });
+                
+                tr.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    if (draggedRow && draggedRow !== tr) {
+                        tr.classList.add('drag-over');
+                    }
+                });
+                
+                tr.addEventListener('dragleave', () => {
+                    tr.classList.remove('drag-over');
+                });
+                
+                tr.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    tr.classList.remove('drag-over');
+                    
+                    if (draggedRow && draggedRow !== tr) {
+                        const allRows = Array.from(tbody.querySelectorAll('tr'));
+                        const draggedIndex = allRows.indexOf(draggedRow);
+                        const targetIndex = allRows.indexOf(tr);
+                        
+                        if (draggedIndex < targetIndex) {
+                            tr.after(draggedRow);
+                        } else {
+                            tr.before(draggedRow);
+                        }
+                        
+                        // 新しい順序を取得
+                        const newOrder = Array.from(tbody.querySelectorAll('tr')).map(row => 
+                            parseInt(row.dataset.rowId)
+                        );
+                        
+                        ws.send(JSON.stringify({
+                            action: 'reorder_rows',
+                            order: newOrder
+                        }));
+                    }
+                });
+            });
+            
+            // フォーカスを復元
+            if (focusedId && !editMode) {
+                const cell = document.querySelector(`td[data-row="${focusedId.row}"][data-column="${focusedId.column}"]`);
+                if (cell) {
+                    cell.focus();
+                    currentCell = cell;
+                }
+            }
+            
+            // イベントリスナー設定
+            setupEventListeners();
+        }
+        
+        // ヘッダー更新
+        function updateHeader() {
+            const headerRow = document.getElementById('header-row');
+            headerRow.innerHTML = '<th>行</th>';
+            
+            const columnNames = {
+                'param': 'Param',
+                'a': 'A',
+                'b': 'B (A + Param)',
+                'c': 'C (A × Param)'
+            };
+            
+            columnOrder.forEach((col, index) => {
+                const th = document.createElement('th');
+                th.textContent = columnNames[col] || col;
+                th.className = 'sortable';
+                th.draggable = true;
+                th.dataset.column = col;
+                th.dataset.index = index;
+                
+                if (sortColumn === col) {
+                    th.classList.add(sortDirection === 'asc' ? 'sorted-asc' : 'sorted-desc');
+                }
+                
+                // ソートイベント
+                th.addEventListener('click', () => {
+                    if (sortColumn === col) {
+                        sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+                    } else {
+                        sortColumn = col;
+                        sortDirection = 'asc';
+                    }
+                    ws.send(JSON.stringify({ action: 'refresh' }));
+                });
+                
+                // 列のドラッグイベント
+                th.addEventListener('dragstart', (e) => {
+                    draggedColumn = th;
+                    e.dataTransfer.effectAllowed = 'move';
+                    th.classList.add('dragging');
+                });
+                
+                th.addEventListener('dragend', () => {
+                    th.classList.remove('dragging');
+                    draggedColumn = null;
+                });
+                
+                th.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    if (draggedColumn && draggedColumn !== th) {
+                        th.classList.add('drag-over');
+                    }
+                });
+                
+                th.addEventListener('dragleave', () => {
+                    th.classList.remove('drag-over');
+                });
+                
+                th.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    th.classList.remove('drag-over');
+                    
+                    if (draggedColumn && draggedColumn !== th) {
+                        const draggedCol = draggedColumn.dataset.column;
+                        const targetCol = th.dataset.column;
+                        
+                        const draggedIndex = columnOrder.indexOf(draggedCol);
+                        const targetIndex = columnOrder.indexOf(targetCol);
+                        
+                        if (draggedIndex !== -1 && targetIndex !== -1) {
+                            const newOrder = [...columnOrder];
+                            // 要素を削除
+                            newOrder.splice(draggedIndex, 1);
+                            // 新しい位置に挿入（削除後のインデックスを考慮）
+                            const insertIndex = draggedIndex < targetIndex ? targetIndex : targetIndex;
+                            newOrder.splice(insertIndex, 0, draggedCol);
+                            
+                            columnOrder = newOrder;
+                            
+                            ws.send(JSON.stringify({
+                                action: 'reorder_columns',
+                                order: newOrder
+                            }));
+                        }
+                    }
+                });
+                
+                headerRow.appendChild(th);
+            });
+        }
+        
+        // イベントリスナー設定
+        function setupEventListeners() {
+            const cells = document.querySelectorAll('td[tabindex]');
+            
+            cells.forEach(cell => {
+                cell.addEventListener('focus', () => {
+                    currentCell = cell;
+                    if (!editMode) {
+                        cell.style.outline = '2px solid #4CAF50';
+                        cell.style.outlineOffset = '-2px';
+                    }
+                });
+                
+                cell.addEventListener('blur', () => {
+                    if (!editMode) {
+                        cell.style.outline = '';
+                    }
+                });
+                
+                cell.addEventListener('keydown', (e) => {
+                    if (!editMode) {
+                        // フォーカスモードでのキー操作
+                        if (e.key === 'Enter' || e.key === 'F2') {
+                            e.preventDefault();
+                            enterEditMode(cell);
+                        } else if (e.key === 'Tab') {
+                            e.preventDefault();
+                            if (e.shiftKey) {
+                                navigateCell('left');
+                            } else {
+                                navigateCell('right');
+                            }
+                        } else if (e.key === 'ArrowUp') {
+                            e.preventDefault();
+                            navigateCell('up');
+                        } else if (e.key === 'ArrowDown') {
+                            e.preventDefault();
+                            navigateCell('down');
+                        } else if (e.key === 'ArrowLeft') {
+                            e.preventDefault();
+                            navigateCell('left');
+                        } else if (e.key === 'ArrowRight') {
+                            e.preventDefault();
+                            navigateCell('right');
+                        } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                            // 文字キーが押されたら編集モードに入り、内容をクリア
+                            e.preventDefault();
+                            enterEditMode(cell, true);
+                            cell.textContent = e.key;
+                            // カーソルを末尾に移動
+                            const range = document.createRange();
+                            const sel = window.getSelection();
+                            range.selectNodeContents(cell);
+                            range.collapse(false);
+                            sel.removeAllRanges();
+                            sel.addRange(range);
+                        }
+                    } else {
+                        // 編集モードでのキー操作
+                        if (e.key === 'Escape') {
+                            e.preventDefault();
+                            cancelEdit(cell);
+                        } else if (e.key === 'Enter') {
+                            e.preventDefault();
+                            exitEditMode(cell);
+                            navigateCell('down');
+                        } else if (e.key === 'Tab') {
+                            e.preventDefault();
+                            exitEditMode(cell);
+                            if (e.shiftKey) {
+                                navigateCell('left');
+                            } else {
+                                navigateCell('right');
+                            }
+                        }
+                    }
+                });
+            });
+        }
+        
+        // 編集モードに入る
+        function enterEditMode(cell, clearContent = false) {
+            editMode = true;
+            originalValue = cell.textContent;
+            cell.contentEditable = 'true';
+            cell.style.backgroundColor = '#f0f8ff';
+            
+            if (clearContent) {
+                cell.textContent = '';
+            }
+            
+            // カーソルを末尾に移動
+            cell.focus();
+            const range = document.createRange();
+            const sel = window.getSelection();
+            range.selectNodeContents(cell);
+            range.collapse(false);
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }
+        
+        // 編集モードを終了
+        function exitEditMode(cell) {
+            editMode = false;
+            cell.contentEditable = 'false';
+            cell.style.backgroundColor = '';
+            
+            const rowId = parseInt(cell.dataset.row);
+            const column = cell.dataset.column;
+            const value = cell.textContent.trim();
+            
+            ws.send(JSON.stringify({
+                action: 'update',
+                row_id: rowId,
+                column: column,
+                value: value === '' ? null : value
+            }));
+        }
+        
+        // 編集をキャンセル
+        function cancelEdit(cell) {
+            editMode = false;
+            cell.contentEditable = 'false';
+            cell.style.backgroundColor = '';
+            cell.textContent = originalValue;
+            cell.focus();
+        }
+        
+        // セルナビゲーション
+        function navigateCell(direction) {
+            if (!currentCell) return;
+            
+            const row = currentCell.parentElement;
+            const cellIndex = Array.from(row.children).indexOf(currentCell);
+            let nextCell = null;
+            
+            switch (direction) {
+                case 'right':
+                    nextCell = row.children[cellIndex + 1];
+                    if (!nextCell || !nextCell.hasAttribute('tabindex')) {
+                        const nextRow = row.nextElementSibling;
+                        if (nextRow) {
+                            nextCell = nextRow.querySelector('td[tabindex]');
+                        }
+                    }
+                    break;
+                    
+                case 'left':
+                    if (cellIndex > 1) { // 行番号をスキップ
+                        nextCell = row.children[cellIndex - 1];
+                    } else {
+                        const prevRow = row.previousElementSibling;
+                        if (prevRow) {
+                            const editableCells = prevRow.querySelectorAll('td[tabindex]');
+                            nextCell = editableCells[editableCells.length - 1];
+                        }
+                    }
+                    break;
+                    
+                case 'down':
+                    const nextRow = row.nextElementSibling;
+                    if (nextRow) {
+                        nextCell = nextRow.children[cellIndex];
+                    }
+                    break;
+                    
+                case 'up':
+                    const prevRow = row.previousElementSibling;
+                    if (prevRow) {
+                        nextCell = prevRow.children[cellIndex];
+                    }
+                    break;
+            }
+            
+            if (nextCell && nextCell.hasAttribute('tabindex')) {
+                nextCell.focus();
+            }
+        }
+        
+        // 行追加
+        function addRow() {
+            ws.send(JSON.stringify({
+                action: 'add_row'
+            }));
+        }
+        
+        // CSVダウンロード
+        function downloadCSV() {
+            window.location.href = `/download-csv/${sessionId}`;
+        }
+        
+        // 初期接続
+        connect();
+    </script>
+</body>
+</html>
